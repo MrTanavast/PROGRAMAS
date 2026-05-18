@@ -48,7 +48,7 @@ DEST_DIR = Path("pdfs_downloaded")
 INDEX_FILE = Path("index_libros.csv")
 STATE_FILE = Path(".scraper_state.txt")
 
-BOOK_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".djvu"}
+BOOK_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".djvu", ".doc", ".docx", ".odt"}
 
 DOWNLOAD_HEADERS = {
     "User-Agent": (
@@ -247,7 +247,9 @@ def main():
                 log.info("[%d pág. | cola: %d] %s", pages_scraped, len(queue), current_url)
 
                 try:
-                    page.goto(current_url, wait_until="networkidle", timeout=30000)
+                    page.goto(current_url, wait_until="domcontentloaded", timeout=20000)
+                    # Pequeña espera para que el JS inyecte los links
+                    page.wait_for_timeout(1500)
                     html = page.content()
                 except Exception as exc:
                     log.warning("Error cargando %s: %s", current_url, exc)
