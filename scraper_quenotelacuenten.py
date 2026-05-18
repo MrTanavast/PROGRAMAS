@@ -34,6 +34,16 @@ from tqdm import tqdm
 # Configuración
 # ---------------------------------------------------------------------------
 BASE_URL = "https://www.quenotelacuenten.org/"
+
+# URLs de entrada — el scraper arranca desde todas ellas y sigue todos los links internos
+SEED_URLS = [
+    "https://www.quenotelacuenten.org/",
+    "https://www.quenotelacuenten.org/libros-recomendados/",
+    "https://www.quenotelacuenten.org/category/libros/",
+    "https://www.quenotelacuenten.org/category/documentos/",
+    "https://www.quenotelacuenten.org/sitemap.xml",
+]
+
 DEST_DIR = Path("pdfs_downloaded")
 INDEX_FILE = Path("index_libros.csv")
 STATE_FILE = Path(".scraper_state.txt")
@@ -68,6 +78,7 @@ def extract_links(html: str, page_url: str, base_domain: str):
     book_links = set()
     internal_links = set()
 
+    # Links normales <a href>
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         if not href or href.startswith(("#", "mailto:", "javascript:")):
@@ -81,6 +92,17 @@ def extract_links(html: str, page_url: str, base_domain: str):
             book_links.add(clean)
         elif parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
             internal_links.add(clean)
+
+    # Sitemap XML: extraer <loc> tags
+    for loc in soup.find_all("loc"):
+        url = loc.get_text(strip=True)
+        parsed = urlparse(url)
+        if parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
+            ext = Path(parsed.path).suffix.lower()
+            if ext in BOOK_EXTENSIONS:
+                book_links.add(url)
+            else:
+                internal_links.add(url)
 
     return book_links, internal_links
 
@@ -193,7 +215,7 @@ def main():
     DEST_DIR.mkdir(exist_ok=True)
     base_domain = urlparse(BASE_URL).netloc
     visited = load_visited(STATE_FILE)
-    queue = deque([BASE_URL])
+    queue = deque(url for url in SEED_URLS if url not in visited)
     session = requests.Session()
     csv_writer = CsvWriter(INDEX_FILE)
 
