@@ -1,6 +1,5 @@
 requests
 beautifulsoup4
-tqdm
-pandas
-ocrmypdf
 lxml
+tqdm
+playwright

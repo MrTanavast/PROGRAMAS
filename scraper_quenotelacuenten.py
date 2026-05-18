@@ -1,28 +1,33 @@
 """
 Scraper de libros/PDFs para quenotelacuenten.org
 
+El sitio usa JavaScript para renderizar el contenido, por lo que se
+usa Playwright (navegador real) para obtener el HTML final.
+
+Instalación:
+    pip install playwright requests tqdm
+    playwright install chromium
+
 Uso:
-    python scraper_quenotelacuenten.py [--ocr] [--delay 1.5] [--max-pages 500]
+    python scraper_quenotelacuenten.py [--delay 2] [--max-pages 500] [--dry-run]
 
 Opciones:
-    --ocr          Aplicar OCR a los PDFs descargados (requiere ocrmypdf)
-    --delay N      Segundos entre peticiones HTTP (default: 1.5)
+    --delay N      Segundos entre páginas (default: 2)
     --max-pages N  Límite de páginas a rastrear (default: sin límite)
     --dry-run      Solo muestra las URLs encontradas sin descargar
+    --headed       Abre el navegador visible (útil para depurar)
 """
 
 import argparse
 import csv
 import hashlib
 import logging
-import os
 import time
 from collections import deque
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -30,23 +35,20 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 BASE_URL = "https://www.quenotelacuenten.org/"
 DEST_DIR = Path("pdfs_downloaded")
-OCR_DIR = Path("pdfs_ocr")
 INDEX_FILE = Path("index_libros.csv")
-STATE_FILE = Path(".scraper_state.txt")   # URLs ya visitadas (permite reanudar)
+STATE_FILE = Path(".scraper_state.txt")
 
 BOOK_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3", ".djvu"}
 
-HEADERS = {
+DOWNLOAD_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 MAX_RETRIES = 4
-BACKOFF_BASE = 2  # segundos (2, 4, 8, 16)
+BACKOFF_BASE = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,29 +59,12 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HTTP con reintentos y backoff exponencial
+# Extracción de links desde HTML renderizado
 # ---------------------------------------------------------------------------
-def fetch(session: requests.Session, url: str, stream=False, timeout=20):
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = session.get(url, stream=stream, timeout=timeout, headers=HEADERS)
-            resp.raise_for_status()
-            return resp
-        except requests.RequestException as exc:
-            if attempt == MAX_RETRIES:
-                log.warning("Fallo definitivo %s: %s", url, exc)
-                return None
-            wait = BACKOFF_BASE ** attempt
-            log.debug("Reintento %d/%d en %ds para %s", attempt, MAX_RETRIES, wait, url)
-            time.sleep(wait)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Extracción de links desde una página
-# ---------------------------------------------------------------------------
-def extract_links(soup: BeautifulSoup, page_url: str, base_domain: str):
-    """Devuelve (book_links, internal_page_links)."""
+def extract_links(html: str, page_url: str, base_domain: str):
+    """Devuelve (book_links, internal_page_links) usando html ya renderizado."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "lxml")
     book_links = set()
     internal_links = set()
 
@@ -89,11 +74,9 @@ def extract_links(soup: BeautifulSoup, page_url: str, base_domain: str):
             continue
         full = urljoin(page_url, href)
         parsed = urlparse(full)
-
-        # Normalizar: quitar fragmento y trailing slash innecesario
         clean = parsed._replace(fragment="").geturl()
-
         ext = Path(parsed.path).suffix.lower()
+
         if ext in BOOK_EXTENSIONS:
             book_links.add(clean)
         elif parsed.netloc == base_domain and parsed.scheme in ("http", "https"):
@@ -103,26 +86,31 @@ def extract_links(soup: BeautifulSoup, page_url: str, base_domain: str):
 
 
 # ---------------------------------------------------------------------------
-# Descarga de un fichero con barra de progreso
+# Descarga de fichero con reintentos y barra de progreso
 # ---------------------------------------------------------------------------
 def download_file(session: requests.Session, url: str, dest: Path, delay: float) -> bool:
     if dest.exists():
-        log.debug("Ya existe: %s", dest.name)
-        return False  # False = no descargado (ya estaba)
+        return False
 
-    resp = fetch(session, url, stream=True)
-    if resp is None:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = session.get(url, stream=True, timeout=30, headers=DOWNLOAD_HEADERS)
+            resp.raise_for_status()
+            break
+        except requests.RequestException as exc:
+            if attempt == MAX_RETRIES:
+                log.warning("Fallo definitivo descargando %s: %s", url, exc)
+                return False
+            time.sleep(BACKOFF_BASE ** attempt)
+    else:
         return False
 
     total = int(resp.headers.get("content-length", 0))
     tmp = dest.with_suffix(".part")
     try:
         with open(tmp, "wb") as f, tqdm(
-            total=total,
-            unit="B",
-            unit_scale=True,
-            desc=dest.name[:50],
-            leave=False,
+            total=total, unit="B", unit_scale=True,
+            desc=dest.name[:50], leave=False,
         ) as bar:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -131,30 +119,17 @@ def download_file(session: requests.Session, url: str, dest: Path, delay: float)
         time.sleep(delay)
         return True
     except Exception as exc:
-        log.error("Error descargando %s: %s", url, exc)
+        log.error("Error guardando %s: %s", url, exc)
         tmp.unlink(missing_ok=True)
         return False
 
 
 # ---------------------------------------------------------------------------
-# OCR (opcional)
-# ---------------------------------------------------------------------------
-def run_ocr(input_path: Path, output_path: Path):
-    try:
-        import ocrmypdf
-        ocrmypdf.ocr(input_path, output_path, deskew=True, progress_bar=False)
-        log.info("OCR ok: %s", output_path.name)
-    except Exception as exc:
-        log.error("Error OCR %s: %s", input_path.name, exc)
-
-
-# ---------------------------------------------------------------------------
-# Nombre de fichero seguro y único basado en URL
+# Nombre de fichero único
 # ---------------------------------------------------------------------------
 def safe_filename(url: str) -> str:
     parsed = urlparse(url)
     name = Path(parsed.path).name.replace(" ", "_") or "file"
-    # Si hay colisión de nombre entre distintas URLs, añadir hash corto
     url_hash = hashlib.md5(url.encode()).hexdigest()[:6]
     stem = Path(name).stem
     suffix = Path(name).suffix or ".bin"
@@ -162,31 +137,30 @@ def safe_filename(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Estado persistente (para reanudar si se interrumpe)
+# Estado persistente
 # ---------------------------------------------------------------------------
 def load_visited(state_file: Path) -> set:
     if not state_file.exists():
         return set()
-    return set(state_file.read_text().splitlines())
+    return set(state_file.read_text(encoding="utf-8").splitlines())
 
 
 def save_visited(state_file: Path, visited: set):
-    state_file.write_text("\n".join(sorted(visited)))
+    state_file.write_text("\n".join(sorted(visited)), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
-# Escritura incremental del índice CSV
+# CSV incremental
 # ---------------------------------------------------------------------------
 class CsvWriter:
     def __init__(self, path: Path):
-        self.path = path
-        self._is_new = not path.exists()
+        is_new = not path.exists()
         self._fh = open(path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
             self._fh,
-            fieldnames=["source_page", "file_url", "local_file", "ocr_file", "extension"],
+            fieldnames=["source_page", "file_url", "local_file", "extension"],
         )
-        if self._is_new:
+        if is_new:
             self._writer.writeheader()
 
     def write(self, row: dict):
@@ -201,17 +175,22 @@ class CsvWriter:
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Scraper de libros quenotelacuenten.org")
-    parser.add_argument("--ocr", action="store_true", help="Aplicar OCR a los PDFs")
-    parser.add_argument("--delay", type=float, default=1.5, help="Segundos entre peticiones")
-    parser.add_argument("--max-pages", type=int, default=0, help="Límite de páginas (0=sin límite)")
-    parser.add_argument("--dry-run", action="store_true", help="Solo muestra URLs sin descargar")
+    parser = argparse.ArgumentParser(description="Scraper quenotelacuenten.org")
+    parser.add_argument("--delay", type=float, default=2.0)
+    parser.add_argument("--max-pages", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--headed", action="store_true", help="Mostrar navegador")
     args = parser.parse_args()
 
-    DEST_DIR.mkdir(exist_ok=True)
-    if args.ocr:
-        OCR_DIR.mkdir(exist_ok=True)
+    # Importar Playwright aquí para dar error claro si no está instalado
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("ERROR: Playwright no está instalado.")
+        print("Ejecuta:  pip install playwright  &&  playwright install chromium")
+        return
 
+    DEST_DIR.mkdir(exist_ok=True)
     base_domain = urlparse(BASE_URL).netloc
     visited = load_visited(STATE_FILE)
     queue = deque([BASE_URL])
@@ -222,73 +201,75 @@ def main():
     total_downloaded = 0
 
     log.info("Iniciando scraping de %s", BASE_URL)
-    log.info("Archivos buscados: %s", ", ".join(BOOK_EXTENSIONS))
+    log.info("Formatos buscados: %s", ", ".join(sorted(BOOK_EXTENSIONS)))
 
-    try:
-        while queue:
-            if args.max_pages and pages_scraped >= args.max_pages:
-                log.info("Límite de %d páginas alcanzado.", args.max_pages)
-                break
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=not args.headed)
+        context = browser.new_context(
+            user_agent=DOWNLOAD_HEADERS["User-Agent"],
+            locale="es-ES",
+        )
+        page = context.new_page()
 
-            current_url = queue.popleft()
-            if current_url in visited:
-                continue
-            visited.add(current_url)
+        try:
+            while queue:
+                if args.max_pages and pages_scraped >= args.max_pages:
+                    log.info("Límite de %d páginas alcanzado.", args.max_pages)
+                    break
 
-            log.info("[%d visitadas | cola: %d] %s", pages_scraped, len(queue), current_url)
+                current_url = queue.popleft()
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
 
-            resp = fetch(session, current_url)
-            if resp is None:
-                continue
+                log.info("[%d pág. | cola: %d] %s", pages_scraped, len(queue), current_url)
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            book_links, page_links = extract_links(soup, current_url, base_domain)
-
-            # Encolar páginas internas aún no visitadas
-            for link in page_links:
-                if link not in visited:
-                    queue.append(link)
-
-            # Descargar libros encontrados
-            for book_url in book_links:
-                ext = Path(urlparse(book_url).path).suffix.lower()
-                filename = safe_filename(book_url)
-                dest = DEST_DIR / filename
-
-                if args.dry_run:
-                    log.info("  [DRY-RUN] %s", book_url)
+                try:
+                    page.goto(current_url, wait_until="networkidle", timeout=30000)
+                    html = page.content()
+                except Exception as exc:
+                    log.warning("Error cargando %s: %s", current_url, exc)
                     continue
 
-                downloaded = download_file(session, book_url, dest, args.delay)
-                if downloaded:
-                    total_downloaded += 1
-                    log.info("  Descargado: %s", filename)
+                book_links, page_links = extract_links(html, current_url, base_domain)
 
-                ocr_path = ""
-                if args.ocr and ext == ".pdf" and dest.exists():
-                    ocr_path = str(OCR_DIR / f"OCR_{filename}")
-                    run_ocr(dest, Path(ocr_path))
+                for link in page_links:
+                    if link not in visited:
+                        queue.append(link)
 
-                csv_writer.write({
-                    "source_page": current_url,
-                    "file_url": book_url,
-                    "local_file": str(dest) if dest.exists() else "",
-                    "ocr_file": ocr_path,
-                    "extension": ext,
-                })
+                for book_url in book_links:
+                    ext = Path(urlparse(book_url).path).suffix.lower()
+                    filename = safe_filename(book_url)
+                    dest = DEST_DIR / filename
 
-            pages_scraped += 1
-            time.sleep(args.delay)
+                    if args.dry_run:
+                        log.info("  [DRY-RUN] %s", book_url)
+                        continue
 
-            # Guardar estado cada 10 páginas
-            if pages_scraped % 10 == 0:
-                save_visited(STATE_FILE, visited)
+                    downloaded = download_file(session, book_url, dest, args.delay)
+                    if downloaded:
+                        total_downloaded += 1
+                        log.info("  + Descargado: %s", filename)
 
-    except KeyboardInterrupt:
-        log.info("Interrumpido por el usuario.")
-    finally:
-        save_visited(STATE_FILE, visited)
-        csv_writer.close()
+                    csv_writer.write({
+                        "source_page": current_url,
+                        "file_url": book_url,
+                        "local_file": str(dest) if dest.exists() else "",
+                        "extension": ext,
+                    })
+
+                pages_scraped += 1
+                time.sleep(args.delay)
+
+                if pages_scraped % 10 == 0:
+                    save_visited(STATE_FILE, visited)
+
+        except KeyboardInterrupt:
+            log.info("Interrumpido por el usuario.")
+        finally:
+            browser.close()
+            save_visited(STATE_FILE, visited)
+            csv_writer.close()
 
     log.info("--- Fin ---")
     log.info("Páginas rastreadas : %d", pages_scraped)
