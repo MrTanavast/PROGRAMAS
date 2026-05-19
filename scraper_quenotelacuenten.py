@@ -57,8 +57,14 @@ DOWNLOAD_HEADERS = {
     ),
 }
 
-MAX_RETRIES = 4
+MAX_RETRIES = 3
 BACKOFF_BASE = 2
+CONNECT_TIMEOUT = 6    # segundos para establecer conexión
+READ_TIMEOUT = 60      # segundos para leer la respuesta
+
+# Circuit breaker: si un host falla este número de veces seguidas, se omite
+CIRCUIT_BREAKER_THRESHOLD = 3
+_host_failures: dict = {}   # host -> nº de fallos consecutivos
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,19 +114,30 @@ def extract_links(html: str, page_url: str, base_domain: str):
 
 
 # ---------------------------------------------------------------------------
-# Descarga de fichero con reintentos y barra de progreso
+# Descarga de fichero con reintentos, circuit breaker y barra de progreso
 # ---------------------------------------------------------------------------
 def download_file(session: requests.Session, url: str, dest: Path, delay: float) -> bool:
     if dest.exists():
         return False
 
+    host = urlparse(url).netloc
+    if _host_failures.get(host, 0) >= CIRCUIT_BREAKER_THRESHOLD:
+        log.warning("Host bloqueado (circuit breaker): %s — omitiendo %s", host, url)
+        return False
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = session.get(url, stream=True, timeout=30, headers=DOWNLOAD_HEADERS)
+            resp = session.get(
+                url, stream=True,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                headers=DOWNLOAD_HEADERS,
+            )
             resp.raise_for_status()
+            _host_failures[host] = 0   # éxito → reset contador
             break
         except requests.RequestException as exc:
-            if attempt == MAX_RETRIES:
+            _host_failures[host] = _host_failures.get(host, 0) + 1
+            if attempt == MAX_RETRIES or _host_failures[host] >= CIRCUIT_BREAKER_THRESHOLD:
                 log.warning("Fallo definitivo descargando %s: %s", url, exc)
                 return False
             time.sleep(BACKOFF_BASE ** attempt)
