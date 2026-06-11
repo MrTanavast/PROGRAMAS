@@ -157,7 +157,7 @@ def main():
     # b) local_file tiene ruta pero el fichero no existe en disco
     mask_empty = df["local_file"].isna() | (df["local_file"] == "")
     mask_missing = df["local_file"].notna() & (df["local_file"] != "") & \
-                   df["local_file"].apply(lambda p: not Path(p).exists())
+                   df["local_file"].apply(lambda p: not Path(str(p)).exists() if pd.notna(p) else False)
 
     pendientes = df[mask_empty | mask_missing].copy()
     log.info("Pendientes en CSV    : %d (vacíos: %d, ruta rota: %d)",
