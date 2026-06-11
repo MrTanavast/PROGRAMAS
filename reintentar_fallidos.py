@@ -33,6 +33,8 @@ READ_TIMEOUT = 90
 MAX_RETRIES = 3
 BACKOFF_BASE = 2
 CIRCUIT_BREAKER_THRESHOLD = 3
+# Hosts excluidos del circuit breaker (grandes archivos públicos)
+CIRCUIT_BREAKER_WHITELIST = {"archive.org"}
 
 DOWNLOAD_HEADERS = {
     "User-Agent": (
@@ -91,7 +93,8 @@ def download_file(session: requests.Session, url: str, dest: Path, delay: float)
         return True
 
     host = urlparse(url).netloc
-    if _host_failures.get(host, 0) >= CIRCUIT_BREAKER_THRESHOLD:
+    use_circuit_breaker = host not in CIRCUIT_BREAKER_WHITELIST
+    if use_circuit_breaker and _host_failures.get(host, 0) >= CIRCUIT_BREAKER_THRESHOLD:
         log.warning("Host bloqueado (circuit breaker): %s", host)
         return False
 
@@ -106,8 +109,9 @@ def download_file(session: requests.Session, url: str, dest: Path, delay: float)
             _host_failures[host] = 0
             break
         except requests.RequestException as exc:
-            _host_failures[host] = _host_failures.get(host, 0) + 1
-            if attempt == MAX_RETRIES or _host_failures[host] >= CIRCUIT_BREAKER_THRESHOLD:
+            if use_circuit_breaker:
+                _host_failures[host] = _host_failures.get(host, 0) + 1
+            if attempt == MAX_RETRIES or (use_circuit_breaker and _host_failures[host] >= CIRCUIT_BREAKER_THRESHOLD):
                 log.warning("Fallo definitivo %s: %s", url, exc)
                 return False
             wait = BACKOFF_BASE ** attempt
